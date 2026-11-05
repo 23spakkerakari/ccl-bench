@@ -236,6 +236,9 @@ def build_server_command(setting: Setting, paths: RunPaths, node_rank: int = 0,
                 "torch_profiler_with_stack": False,
                 "torch_profiler_record_shapes": bool(cfg["profiling"].get("record_shapes", True)),
                 "torch_profiler_use_gzip": True,
+                # The default per-worker kernel summary (profiler_out.txt) takes minutes to
+                # compute while the engines sit stalled; CCL-Bench doesn't use it.
+                "torch_profiler_dump_cuda_time_total": False,
             })
         # TPU worker uses jax.profiler and ignores iteration bounds; the client
         # stops it after N steps by watching the engine's step counter.

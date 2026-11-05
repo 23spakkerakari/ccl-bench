@@ -3,10 +3,11 @@
 
 For every max-concurrency value in configs/experiments.yaml:
   1. warmup     — a few requests at that concurrency (TPU compiles its batch bucket here)
-  2. fine trace — POST /start_profile; the first `fine_grained_steps` engine steps of the
-                  measured run are captured (GPU: engine-side max_iterations; TPU: this
+  2. fine trace — a short separate pass with the profiler on; its first `fine_grained_steps`
+                  engine steps are captured (GPU: engine-side max_iterations; TPU: this
                   script watches the engine step counter and POSTs /stop_profile)
-  3. measure    — `vllm bench serve` on ShareGPT, per-request TTFT/TPOT/ITL/E2EL saved
+  3. measure    — `vllm bench serve` on ShareGPT with NO profiler attached; per-request
+                  TTFT/TPOT/ITL/E2EL saved
   4. collect    — raw traces -> CCL-Bench directory + workload card (bench/collect_traces.py)
 Throughout, /metrics is scraped every `coarse_interval_s` into coarse/metrics.jsonl.
 
@@ -106,10 +107,11 @@ class StepWatcher(threading.Thread):
         self.baseline = engine_steps(url)
         self.steps_seen = 0.0
         self.stopped = threading.Event()
+        self.cancel = threading.Event()
 
     def run(self) -> None:
         deadline = time.time() + self.timeout
-        while time.time() < deadline and not self.stopped.is_set():
+        while time.time() < deadline and not self.cancel.is_set():
             try:
                 self.steps_seen = engine_steps(self.url) - self.baseline
                 if self.steps_seen >= self.n:
@@ -163,7 +165,9 @@ def bench_cmd(setting: Setting, url: str, concurrency: int, num_prompts: int, se
     return cmd
 
 
-def run_logged(cmd: list[str], log_path: Path) -> int:
+def run_logged(cmd: list[str], log_path: Path, tag: str, echo: bool = False) -> int:
+    """Run a `vllm bench serve` pass. Only the measured pass echoes its stats to the console."""
+    t0 = time.time()
     with open(log_path, "w") as log:
         log.write("$ " + " ".join(cmd) + "\n")
         log.flush()
@@ -171,14 +175,58 @@ def run_logged(cmd: list[str], log_path: Path) -> int:
         assert proc.stdout is not None
         for line in proc.stdout:
             log.write(line)
-            if any(k in line for k in ("throughput", "TTFT", "TPOT", "Error", "error")):
-                sys.stdout.write("    " + line)
-        return proc.wait()
+            if echo and any(k in line for k in ("throughput", "TTFT", "TPOT")):
+                sys.stdout.write(f"    [{tag}] " + line)
+            elif any(k in line for k in ("Error", "error", "Traceback")):
+                sys.stdout.write(f"    [{tag}] " + line)
+        rc = proc.wait()
+    if not echo:
+        print(f"    [{tag}] done in {time.time() - t0:.0f}s (rc={rc}, log: {log_path.name})", flush=True)
+    return rc
 
 
 # ----------------------------------------------------------------------------
 # One sweep point
 # ----------------------------------------------------------------------------
+def profile_pass(setting: Setting, paths: RunPaths, url: str, concurrency: int, seed: int,
+                 label: str) -> list[Path]:
+    """Fine-grained logging: trace the first N engine steps of a short, separate run.
+
+    Kept apart from the measured run because writing the traces stalls every EP engine
+    for a while, which would otherwise pollute the saved throughput and tail latencies.
+    """
+    cfg = setting.cfg
+    n_steps = int(cfg["profiling"]["fine_grained_steps"])
+    n_prompts = max(2 * concurrency, 8)   # enough work to cover N steps at this load
+    tpu_before = collect_traces.tpu_sessions(paths) if setting.platform == "tpu" else set()
+    watcher = None
+    if setting.platform == "gpu":
+        start_profile(url, prefix=label)          # worker auto-stops after max_iterations
+    else:
+        start_profile(url, prefix=None)           # TPU parses the prefix as profiler options
+        watcher = StepWatcher(url, n_steps)
+        watcher.start()
+
+    run_logged(bench_cmd(setting, url, concurrency, n_prompts, seed, None),
+               paths.logs / f"profile_{label}.log", tag="profile")
+
+    if watcher is not None:
+        watcher.stopped.wait(timeout=30)
+        if not watcher.stopped.is_set():
+            watcher.cancel.set()
+            watcher.stopped.wait(timeout=600)
+        print(f"    [profile] TPU profiler stopped after ~{watcher.steps_seen:.0f} engine steps")
+        files = collect_traces.wait_for_files(
+            lambda: [f for s in collect_traces.tpu_sessions(paths) - tpu_before
+                     for f in collect_traces.tpu_session_files(s)], expected=1)
+    else:
+        stop_profile(url)                         # no-op if the worker already stopped itself
+        files = collect_traces.wait_for_files(
+            lambda: collect_traces.gpu_trace_files(paths, label), expected=setting.chips)
+    print(f"    [profile] {len(files)} trace file(s) written", flush=True)
+    return files
+
+
 def run_point(setting: Setting, paths: RunPaths, url: str, concurrency: int, index: int,
               poller: CoarsePoller) -> dict:
     cfg = setting.cfg
@@ -187,47 +235,28 @@ def run_point(setting: Setting, paths: RunPaths, url: str, concurrency: int, ind
     label = f"c{concurrency}"
     print(f"\n=== {setting.name} | max_concurrency={concurrency} | {n} prompts ===", flush=True)
 
+    # 1. warmup (not saved)
     poller.point = f"{label}-warmup"
     warm = int(cfg["sweep"].get("warmup_prompts", 0))
     if warm:
-        rc = run_logged(bench_cmd(setting, url, concurrency, max(warm, concurrency), seed + 1000 + index, None),
-                        paths.logs / f"warmup_{label}.log")
-        if rc:
-            print(f"[bench] warmup for {label} exited {rc}; continuing", file=sys.stderr)
+        run_logged(bench_cmd(setting, url, concurrency, max(warm, concurrency), seed + 1000 + index, None),
+                   paths.logs / f"warmup_{label}.log", tag="warmup")
 
+    # 2. fine-grained trace in its own short pass (not saved)
     profiling = should_profile_point(cfg, concurrency, index)
-    n_steps = int(cfg["profiling"]["fine_grained_steps"])
-    watcher = None
-    tpu_before = collect_traces.tpu_sessions(paths) if setting.platform == "tpu" else set()
+    trace_files: list[Path] = []
     if profiling:
-        if setting.platform == "gpu":
-            start_profile(url, prefix=label)      # worker auto-stops after max_iterations
-        else:
-            start_profile(url, prefix=None)       # TPU parses the prefix as profiler options
-            watcher = StepWatcher(url, n_steps)
-            watcher.start()
+        poller.point = f"{label}-profile"
+        trace_files = profile_pass(setting, paths, url, concurrency, seed + 2000 + index, label)
 
+    # 3. measured run, no profiler attached
     poller.point = label
     result = paths.bench / f"{label}.json"
     t0 = time.time()
-    rc = run_logged(bench_cmd(setting, url, concurrency, n, seed, result), paths.logs / f"bench_{label}.log")
+    rc = run_logged(bench_cmd(setting, url, concurrency, n, seed, result),
+                    paths.logs / f"bench_{label}.log", tag="measure", echo=True)
     wall = time.time() - t0
     poller.point = f"{label}-done"
-
-    trace_files: list[Path] = []
-    if profiling:
-        if watcher is not None:
-            watcher.stopped.wait(timeout=60)
-            if not watcher.stopped.is_set():
-                stop_profile(url)
-            print(f"[bench] TPU profile stopped after ~{watcher.steps_seen:.0f} engine steps")
-            trace_files = collect_traces.wait_for_files(
-                lambda: [f for s in collect_traces.tpu_sessions(paths) - tpu_before
-                         for f in collect_traces.tpu_session_files(s)], expected=1)
-        else:
-            stop_profile(url)                     # no-op if the worker already stopped itself
-            trace_files = collect_traces.wait_for_files(
-                lambda: collect_traces.gpu_trace_files(paths, label), expected=setting.chips)
 
     ccl_dir = collect_traces.assemble_point(setting, paths, concurrency, trace_files)
     summary = {"concurrency": concurrency, "num_prompts": n, "returncode": rc, "wall_s": round(wall, 1),
