@@ -1,0 +1,97 @@
+# =============================================================================
+# Team 15 experiment matrix: {GPU, TPU} x {4, 8 chips} x {all-gather, all-to-all}
+# ${VARS} are expanded from the environment (activate_env.sh sets EPB_*).
+# =============================================================================
+
+model:
+  id: Qwen/Qwen3-30B-A3B
+  served_name: qwen3-30b-a3b
+  precision: bf16
+  # Filled from the HF config.json at runtime when available; these are fallbacks.
+  arch_fallback:
+    num_params: 30500000000          # model card: 30.5B total
+    num_active_params: 3300000000    # model card: 3.3B activated
+    num_layers: 48
+    num_heads: 32
+    num_kv_heads: 4
+    head_dim: 128
+    hidden_size: 2048
+    moe_intermediate_size: 768
+    num_experts: 128
+    num_experts_per_tok: 8
+    vocab_size: 151936
+
+dataset:
+  name: sharegpt_v3_unfiltered_cleaned_split
+  hf_repo: learnanything/sharegpt_v3_unfiltered_cleaned_split
+  path: ${EPB_DATA_DIR}/sharegpt_v3.json   # written by bench/prepare_data.py
+  seed: 0
+  # ignore_eos makes every request emit exactly the ShareGPT reference length, so
+  # GPU and TPU generate identical token counts (otherwise EOS timing differs).
+  ignore_eos: true
+
+# Server knobs shared by every setting (per-setting overrides allowed below).
+serving:
+  port: 8000
+  max_model_len: 4096
+  max_num_seqs: 256
+  max_num_batched_tokens: 8192
+  gpu_memory_utilization: 0.90       # also used as HBM fraction on TPU
+  enable_prefix_caching: false       # keep prefill work identical across runs
+  enforce_eager: false               # true = no CUDA graphs (cleaner kernel traces, slower)
+  extra_args: []                     # appended verbatim to `vllm serve`
+
+# Throughput/latency sweep -> one Pareto point per max-concurrency value.
+sweep:
+  max_concurrency: [1, 2, 4, 8, 16, 32, 64, 128, 256]
+  request_rate: inf                  # closed-loop: concurrency is the load knob
+  # num_prompts per point = clamp(prompts_per_concurrency * C, min, max)
+  prompts_per_concurrency: 10
+  min_prompts: 100
+  max_prompts: 1000
+  warmup_prompts: 32                 # sent before each point, never profiled
+
+# Logging granularity
+profiling:
+  fine_grained_steps: 5              # profiler trace of the first N engine steps of each point
+  profile_points: all                # all | first | none | [list of concurrencies]
+  coarse_interval_s: 1.0             # /metrics scrape period for the whole run
+  record_shapes: true                # tensor shapes in kineto (message sizes for bandwidth tools)
+
+# How each EP implementation is selected on each platform.
+ep_impl:
+  gpu:
+    allgather:
+      all2all_backend: allgather_reducescatter
+    alltoall:
+      # !!! No A100-compatible all-to-all backend exists in vLLM 0.32:
+      #   pplx and naive were removed (vLLM silently falls back to allgather!),
+      #   DeepEP requires Hopper+, flashinfer_nvlink_* targets MNNVL systems.
+      # Set this deliberately once you've agreed on a choice with Eric.
+      all2all_backend: null
+  tpu:
+    allgather:
+      env: {USE_MOE_EP_KERNEL: "0"}    # GMM_EP: all-gather tokens + reduce-scatter
+    alltoall:
+      env: {USE_MOE_EP_KERNEL: "1"}    # fused Pallas EP kernel: remote-copy dispatch/combine
+
+settings:
+  # ---- Perlmutter A100 (4 per node). DP attention + EP across all GPUs. ----
+  gpu-ep4-allgather: {platform: gpu, chips: 4, nodes: 1, ep_impl: allgather}
+  gpu-ep4-alltoall:  {platform: gpu, chips: 4, nodes: 1, ep_impl: alltoall}
+  gpu-ep8-allgather: {platform: gpu, chips: 8, nodes: 2, ep_impl: allgather}   # crosses Slingshot
+  gpu-ep8-alltoall:  {platform: gpu, chips: 8, nodes: 2, ep_impl: alltoall}
+  # ---- Cloud TPU v6e (single host). TP attention + EP across all chips. ----
+  tpu-ep4-allgather: {platform: tpu, chips: 4, nodes: 1, ep_impl: allgather}
+  tpu-ep4-alltoall:  {platform: tpu, chips: 4, nodes: 1, ep_impl: alltoall}
+  tpu-ep8-allgather: {platform: tpu, chips: 8, nodes: 1, ep_impl: allgather}
+  tpu-ep8-alltoall:  {platform: tpu, chips: 8, nodes: 1, ep_impl: alltoall}
+
+# TPU attention layout. false = TP attention (tpu-inference default). true =
+# DP attention like the GPU runs (attn_dp_size = chips), for layout parity.
+tpu:
+  attn_dp: false
+
+contributor: "Team 15 (Kevin Peng, Raymond Lin, Ty Galasinski, Aaron Gao)"
+contact: ""
+group_tag: group_15
