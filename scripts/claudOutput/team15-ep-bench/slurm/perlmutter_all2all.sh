@@ -23,6 +23,9 @@
 # builds for A100 (DISABLE_SM90_FEATURES=1 hits `assert False, 'Not implemented'`).
 # The pinned hybrid-ep commit below still has the A100 intranode path, and its
 # deep_ep.Buffer API matches what vLLM 0.32's DeepEP high-throughput code calls.
+# The build patches that checkout: NVSHMEM forced off (torch's pip deps install it),
+# and the Hopper-only hybrid-EP extension is skipped. It builds with the first
+# GCC >= 10 it finds (torch needs C++20; Perlmutter's plain `c++` is GCC 7).
 #
 # Limits (by construction of the A100 build):
 #   * single node only (EP <= 4). Multi-node needs NVSHMEM + Hopper+ kernels.
@@ -178,24 +181,79 @@ ensure_matching_nvcc() {
   log "nvcc ${have} (CUDA_HOME=${CUDA_HOME}) matches torch CUDA ${want}"
 }
 
-# DeepEP's setup.py turns NVSHMEM off only when `import nvidia.nvshmem` fails, and the
-# A100 build asserts it is off. torch >= 2.8 wheels depend on nvidia-nvshmem-cu1x, so in
-# a vLLM env that import always works. Force it off in setup.py instead of uninstalling
-# a torch dependency. Idempotent.
-patch_out_nvshmem() {
-  "${PYTHON}" - "${SRC_DIR}/setup.py" <<'PY'
+# torch >= 2.10 compiles extensions with -std=c++20 and takes the host compiler from
+# $CXX (default `c++`) and nvcc's -ccbin from $CC. On Perlmutter `c++` is the SLES
+# system GCC 7, which rejects -std=c++20; newer GCCs are installed as g++-13 etc.
+# (module gcc-native). Pick the first GCC >= 10 and export CC/CXX for the build.
+ensure_host_compiler() {
+  gxx_major() { "$1" -dumpversion 2>/dev/null | cut -d. -f1; }
+  find_gxx() {
+    local c v
+    for c in ${CXX:-} g++-13 g++-12 g++-14 g++-11 g++-15 g++-10 g++ c++; do
+      command -v "${c}" >/dev/null 2>&1 || continue
+      v="$(gxx_major "${c}")"
+      [[ "${v}" =~ ^[0-9]+$ && "${v}" -ge 10 ]] && { command -v "${c}"; return 0; }
+    done
+    return 1
+  }
+  local gxx gcc
+  gxx="$(find_gxx || true)"
+  if [[ -z "${gxx}" ]] && type module >/dev/null 2>&1; then
+    log "no GCC >= 10 on PATH (c++ is GCC $(gxx_major c++ || echo '?')); trying module load gcc-native"
+    set +eu
+    module load gcc-native >/dev/null 2>&1
+    set -eu
+    gxx="$(find_gxx || true)"
+  fi
+  [[ -n "${gxx}" ]] || die "need GCC >= 10 for torch's -std=c++20 (found GCC $(gxx_major c++ || echo none) as c++).
+       Try 'module load gcc-native' (then check 'ls /usr/bin/g++-*'), or install one into the env:
+       conda install -c conda-forge gxx_linux-64=13   and re-run with CXX=x86_64-conda-linux-gnu-g++"
+  # Matching C compiler: g++-13 -> gcc-13, x86_64-conda-linux-gnu-g++ -> ...-gcc, g++ -> gcc
+  gcc="$(dirname "${gxx}")/$(basename "${gxx}" | sed -e 's/g++/gcc/' -e 's/^c++$/cc/')"
+  [[ -x "${gcc}" ]] || gcc="${gxx}"
+  export CXX="${gxx}" CC="${gcc}" NVCC_CCBIN="${gcc}"
+  log "host compiler: CXX=${CXX} (GCC $(gxx_major "${CXX}")), CC=${CC}"
+}
+
+# Three edits to the pinned DeepEP checkout. Idempotent; refuses if the files look different.
+#  1. setup.py turns NVSHMEM off only when `import nvidia.nvshmem` fails, and the A100
+#     build asserts it is off. torch >= 2.8 wheels depend on nvidia-nvshmem-cu1x, so in a
+#     vLLM env that import always works. Force it off instead of uninstalling a torch dep.
+#  2. Don't build hybrid_ep_cpp: its kernels use TMA (Hopper+), vLLM's deepep_high_throughput
+#     doesn't use it, and it hard-codes -std=c++17 against torch headers built for C++20.
+#  3. Make deep_ep/__init__.py import fine without hybrid_ep_cpp.
+patch_deepep_source() {
+  "${PYTHON}" - "${SRC_DIR}" <<'PY'
 import pathlib, sys
-p = pathlib.Path(sys.argv[1])
-s = p.read_text()
-old = "    disable_nvshmem = False\n    nvshmem_dir = os.getenv('NVSHMEM_DIR', None)\n"
-new = ("    disable_nvshmem = True  # patched by perlmutter_all2all.sh: A100 build must not use NVSHMEM\n"
-       "    nvshmem_dir = os.getenv('NVSHMEM_DIR', None)\n")
-if new in s:
-    sys.exit(0)
-if s.count(old) != 1:
-    sys.exit("DeepEP setup.py does not look like the expected commit; cannot disable NVSHMEM detection")
-p.write_text(s.replace(old, new))
-print("patched setup.py: NVSHMEM disabled")
+src = pathlib.Path(sys.argv[1])
+TAG = "patched by perlmutter_all2all.sh"
+edits = [
+    ("setup.py",
+     "    disable_nvshmem = False\n    nvshmem_dir = os.getenv('NVSHMEM_DIR', None)\n",
+     f"    disable_nvshmem = True  # {TAG}: A100 build must not use NVSHMEM\n"
+     "    nvshmem_dir = os.getenv('NVSHMEM_DIR', None)\n"),
+    ("setup.py",
+     "            get_extension_deep_ep_cpp(),\n            get_extension_hybrid_ep_cpp()\n",
+     f"            get_extension_deep_ep_cpp(),\n            # hybrid_ep_cpp not built ({TAG}): Hopper+ only\n"),
+    ("deep_ep/__init__.py",
+     "from .hybrid_ep_buffer import HybridEPBuffer\n",
+     f"try:  # {TAG}: hybrid-EP is not built for A100\n"
+     "    from .hybrid_ep_buffer import HybridEPBuffer\n"
+     "except ImportError:\n    HybridEPBuffer = None\n"),
+    ("deep_ep/__init__.py",
+     "from hybrid_ep_cpp import HybridEpConfigInstance\n",
+     "try:\n    from hybrid_ep_cpp import HybridEpConfigInstance\n"
+     "except ImportError:\n    HybridEpConfigInstance = None\n"),
+]
+for rel, old, new in edits:
+    p = src / rel
+    s = p.read_text()
+    if new in s:
+        continue
+    if s.count(old) != 1:
+        sys.exit(f"DeepEP {rel} does not look like the expected commit; cannot apply A100 patch:\n{old}")
+    p.write_text(s.replace(old, new))
+print("patched DeepEP: NVSHMEM off, hybrid-EP extension skipped")
 PY
 }
 
@@ -209,11 +267,12 @@ prepare_source() {
     log "applying patch ${DEEPEP_PATCH}"
     (cd "${SRC_DIR}" && patch -p1 < "${DEEPEP_PATCH}")
   fi
-  patch_out_nvshmem
+  patch_deepep_source
 }
 
 build_from_source() {
   ensure_matching_nvcc
+  ensure_host_compiler
   prepare_source
   if ! "${PYTHON}" -c "import ninja" >/dev/null 2>&1; then
     "${PYTHON}" -m pip install -q ninja >/dev/null 2>&1 \
@@ -254,7 +313,12 @@ install_deepep() {
 if [[ "${FORCE_REINSTALL:-0}" == "1" ]] || ! deepep_ok; then
   install_deepep
 fi
-deepep_ok || die "deep_ep failed to import after install (torch ABI mismatch is the usual cause: FORCE_REINSTALL=1 to rebuild in this env)"
+if ! deepep_ok; then
+  "${PYTHON}" -c "import deep_ep, deep_ep_cpp" 2>&1 | tail -3 >&2 || true
+  die "deep_ep failed to import after install. 'GLIBCXX_... not found' means the runtime libstdc++ is older
+       than the GCC used to build: run 'conda install -c conda-forge libstdcxx-ng' in the env. Otherwise a
+       torch ABI mismatch is the usual cause: FORCE_REINSTALL=1 to rebuild in this env."
+fi
 "${PYTHON}" -c "import deep_ep; print('deep_ep import OK:', deep_ep.__file__, '| SM90 features compiled:', deep_ep.Buffer.is_sm90_compiled())"
 
 # -----------------------------------------------------------------------------
